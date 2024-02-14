@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 #
 # This script fetches log data from Azure DevOps and forwards it to ServiceNow's Cloud
 # Observability SaaS platform. Please see the link below for more information.
