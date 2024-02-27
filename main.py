@@ -14,7 +14,11 @@ import json
 import requests
 import time
 from datetime import datetime, timezone
+import dateutil.parser
 from requests.auth import HTTPBasicAuth
+
+print("Starting ado-to-otlp...")
+print("Runtime information:", sys.version)
 
 start_time = datetime.now(timezone.utc)
 
@@ -207,99 +211,115 @@ while True:
         for pipeline in projects[project_name]["pipelines"]:
             runs = list_runs(project_name, pipeline)
             for run in runs.get("value"):
-                run_url = run.get("url")
-                run_created_at = datetime.fromisoformat(run.get("createdDate"))
-
-                if start_time > run_created_at:
-                    continue
-
-                if history.get(run_url) is not None:
-                    continue
-
-                if run.get("state") != "completed":
-                    continue
-
                 try:
-                    print("Fetching logs for run:", run_url)
+                    run_url = run.get("url")
 
-                    payload = []
-                    payload_size = 0
+                    run_created_at = dateutil.parser.parse(run.get("createdDate"))
 
-                    logs_result = list_logs(project_name, pipeline, run.get("id"))
-                    for log in logs_result.get("logs"):
-                        log_results = get_log(
-                            project_name, pipeline, run.get("id"), log.get("id")
-                        )
-                        log_url = log_results.get("url")
-                        log_url = log_results.get("signedContent", {}).get("url")
+                    if start_time > run_created_at:
+                        continue
 
-                        res = s.get(log_url)
-                        res.raise_for_status()
+                    if history.get(run_url) is not None:
+                        continue
 
-                        log_lines = res.text.split("\n")
-                        for line in log_lines:
-                            line = line.strip()
-                            if line == "":
-                                continue
+                    if run.get("state") != "completed":
+                        continue
 
-                            line_content = {
-                                "organization": organization,
-                                "project": project_name,
-                                "body": line,
-                                "log.id": log_results.get("id"),
-                                "log.url": log_results.get("url"),
-                                "log.line_count": log_results.get("lineCount"),
-                                "run.url": run.get("_links", {})
-                                .get("web", {})
-                                .get("href"),
-                                "run.state": run.get("state"),
-                                "run.result": run.get("result"),
-                                "run.id": run.get("id"),
-                                "run.name": run.get("name"),
-                                "pipeline.name": run.get("pipeline", {}).get("name"),
-                                "pipeline.folder": run.get("pipeline", {}).get(
-                                    "folder"
-                                ),
-                                "pipeline.revision": run.get("pipeline", {}).get(
-                                    "revision"
-                                ),
-                                "pipeline.id": run.get("pipeline", {}).get("id"),
-                                "pipeline.url": run.get("_links", {}).get(
-                                    "pipeline.web"
-                                ),
-                                "_ts": log_results.get("createdOn"),
-                            }
+                    try:
+                        print("Fetching logs for run:", run_url)
 
-                            action_line = (
-                                '{ "index" : { "_index" : "ado_pipeline_logs" } }'
+                        payload = []
+                        payload_size = 0
+
+                        logs_result = list_logs(project_name, pipeline, run.get("id"))
+                        for log in logs_result.get("logs"):
+                            log_results = get_log(
+                                project_name, pipeline, run.get("id"), log.get("id")
                             )
-                            json_line = json.dumps(line_content)
-                            payload_size += len(json_line) + len(action_line)
+                            log_url = log_results.get("url")
+                            log_url = log_results.get("signedContent", {}).get("url")
 
-                            payload.append(action_line)
-                            payload.append(json_line)
+                            res = s.get(log_url)
+                            res.raise_for_status()
 
-                            if payload_size > (5 * 1024 * 1024):
-                                send_payload(payload)
+                            log_lines = res.text.split("\n")
+                            for line in log_lines:
+                                line = line.strip()
+                                if line == "":
+                                    continue
 
-                                payload = []
-                                payload_size = 0
+                                line_content = {
+                                    "organization": organization,
+                                    "project": project_name,
+                                    "body": line,
+                                    "log.id": log_results.get("id"),
+                                    "log.url": log_results.get("url"),
+                                    "log.line_count": log_results.get("lineCount"),
+                                    "run.url": run.get("_links", {})
+                                    .get("web", {})
+                                    .get("href"),
+                                    "run.state": run.get("state"),
+                                    "run.result": run.get("result"),
+                                    "run.id": run.get("id"),
+                                    "run.name": run.get("name"),
+                                    "pipeline.name": run.get("pipeline", {}).get(
+                                        "name"
+                                    ),
+                                    "pipeline.folder": run.get("pipeline", {}).get(
+                                        "folder"
+                                    ),
+                                    "pipeline.revision": run.get("pipeline", {}).get(
+                                        "revision"
+                                    ),
+                                    "pipeline.id": run.get("pipeline", {}).get("id"),
+                                    "pipeline.url": run.get("_links", {}).get(
+                                        "pipeline.web"
+                                    ),
+                                    "_ts": log_results.get("createdOn"),
+                                }
 
-                    if len(payload) > 0:
-                        send_payload(payload)
+                                action_line = (
+                                    '{ "index" : { "_index" : "ado_pipeline_logs" } }'
+                                )
+                                json_line = json.dumps(line_content)
+                                payload_size += len(json_line) + len(action_line)
 
-                    history[run_url] = True
+                                payload.append(action_line)
+                                payload.append(json_line)
+
+                                if payload_size > (5 * 1024 * 1024):
+                                    send_payload(payload)
+
+                                    payload = []
+                                    payload_size = 0
+
+                        if len(payload) > 0:
+                            send_payload(payload)
+
+                        history[run_url] = True
+                    except Exception as e:
+                        print(
+                            json.dumps(
+                                {
+                                    "message": "Encountered error while retrieving logs for run",
+                                    "run_url": run_url,
+                                    "log_url": log_url,
+                                    "exception": str(e),
+                                }
+                            )
+                        )
+                        time.sleep(1)
+
                 except Exception as e:
                     print(
                         json.dumps(
                             {
-                                "message": "Encountered error while retrieving logs for run",
+                                "message": "Encountered error on run",
                                 "run_url": run_url,
                                 "exception": str(e),
                             }
                         )
                     )
-                    time.sleep(1)
 
     time.sleep(30)
 
