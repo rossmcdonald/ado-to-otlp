@@ -78,7 +78,7 @@ def build_project_cache():
     print("Building project cache")
     list_projects_response = list_projects()
     while list_projects_response is not None:
-        for project in list_projects_response.get("value"):
+        for project in list_projects_response.get("value", []):
             projects[project.get("name")] = project
 
         continuation_token = list_projects_response.get("continuation_token")
@@ -109,9 +109,10 @@ def build_pipeline_cache():
         print("Building pipeline cache for project:", project_name)
         list_pipelines_response = list_pipelines(project_name)
         while list_pipelines_response is not None:
-            for pipeline in list_pipelines_response.get("value"):
-                if projects[project_name].get("pipelines") is None:
-                    projects[project_name]["pipelines"] = {}
+            if projects[project_name].get("pipelines") is None:
+                projects[project_name]["pipelines"] = {}
+
+            for pipeline in list_pipelines_response.get("value", []):
                 projects[project_name]["pipelines"][pipeline.get("id")] = pipeline
 
             continuation_token = list_pipelines_response.get("continuation_token")
@@ -208,7 +209,7 @@ last_cache_update = datetime.now(timezone.utc)
 print("Waiting for runs...")
 while True:
     for project_name in projects:
-        for pipeline in projects[project_name]["pipelines"]:
+        for pipeline in projects[project_name].get("pipelines", []):
             runs = list_runs(project_name, pipeline)
             for run in runs.get("value"):
                 try:
