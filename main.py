@@ -69,12 +69,13 @@ metrics.set_meter_provider(provider)
 meter = metrics.get_meter("ado.meter")
 
 runs_counter = meter.create_counter(
-    "ado.runs",
+    "ado.runs_count",
     description="The number of runs executed",
 )
 runs_time_taken_counter = meter.create_counter(
     "ado.runs_time_taken_ms",
-    description="The time taken for each run in ms",
+    unit="milliseconds",
+    description="The time taken for each run in milliseconds",
 )
 
 s = requests.Session()
