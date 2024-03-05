@@ -57,6 +57,9 @@ s.auth = HTTPBasicAuth("", access_token)
 logingest = requests.Session()
 logingest.auth = HTTPBasicAuth("", cloudobs_access_token)
 
+metricingest = requests.Session()
+metricingest.auth = HTTPBasicAuth("", cloudobs_access_token)
+
 projects = {}
 history = {}
 
@@ -139,6 +142,27 @@ def list_runs(project: str, pipeline: str, continuation_token: str = None):
     return res.json()
 
 
+def get_run(project: str, pipeline: str, run: str):
+    params = {"api-version": api_version}
+
+    res = s.get(
+        "/".join(
+            [
+                organization_url,
+                project,
+                "_apis",
+                "pipelines",
+                str(pipeline),
+                "runs",
+                str(run),
+            ]
+        ),
+        params=params,
+    )
+    res.raise_for_status()
+    return res.json()
+
+
 def list_logs(project: str, pipeline: str, run: str, continuation_token: str = None):
     params = {"api-version": api_version}
     if continuation_token is not None:
@@ -190,7 +214,7 @@ def get_log(
     return res.json()
 
 
-def send_payload(payload):
+def send_logs_payload(payload):
     logingest_res = logingest.post(
         "https://logingest.lightstep.com/_bulk",
         headers={"Content-Type": "application/json"},
@@ -200,6 +224,14 @@ def send_payload(payload):
 
     if logingest_res.json().get("errors") == True:
         raise Exception("Bad response:", logingest_res.text[:500])
+
+
+def send_metrics_payload(payload):
+    res = logingest.post("https://ingest.lightstep.com/v1/metrics", json=payload)
+    res.raise_for_status()
+
+    if res.json().get("errors") == True:
+        raise Exception("Bad response:", res.text[:500])
 
 
 build_project_cache()
@@ -225,6 +257,94 @@ while True:
 
                     if run.get("state") != "completed":
                         continue
+
+                    try:
+                        run_data = get_run(project_name, pipeline, run.get("id"))
+
+                        created = dateutil.parser.parse(run_data.get("createdDate"))
+                        finished = dateutil.parser.parse(run_data.get("finishedDate"))
+                        time_taken_ms = int((finished - created).total_seconds()) * 1e6
+
+                        attributes = {
+                            "state": run.get("state"),
+                            "result": run.get("result"),
+                            "name": run.get("name"),
+                            "project": project_name,
+                            "organization": organization,
+                            "pipeline_name": run_data.get("pipeline", {}).get("name"),
+                            "pipeline_folder": run_data.get("pipeline", {}).get(
+                                "folder"
+                            ),
+                            "pipeline_revision": run_data.get("pipeline", {}).get(
+                                "revision"
+                            ),
+                            "pipeline_id": run_data.get("pipeline", {}).get("id"),
+                        }
+
+                        metric_data = {
+                            "resourceMetrics": [
+                                {
+                                    "resource": {
+                                        "attributes": [
+                                            {
+                                                "key": "service.name",
+                                                "value": {
+                                                    "stringValue": "azure-devops"
+                                                },
+                                            }
+                                        ]
+                                    },
+                                    "scopeMetrics": [
+                                        {
+                                            "metrics": [
+                                                {
+                                                    "name": "ado.run.time_taken_ms",
+                                                    "unit": "ms",
+                                                    "description": "The time taken in ms to execute a run",
+                                                    "gauge": {
+                                                        # "aggregationTemporality": 1,
+                                                        # "isMonotonic": True,
+                                                        "dataPoints": [
+                                                            {
+                                                                "asDouble": time_taken_ms,
+                                                                # "startTimeUnixNano": "1544712660300000000",
+                                                                "timeUnixNano": str(
+                                                                    int(
+                                                                        created.timestamp()
+                                                                        * 1e9
+                                                                    )
+                                                                ),
+                                                                "attributes": [],
+                                                            }
+                                                        ],
+                                                    },
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+
+                        for k, v in attributes.items():
+                            metric_data["resourceMetrics"][0]["scopeMetrics"][0][
+                                "metrics"
+                            ][0]["gauge"]["dataPoints"][0]["attributes"].append(
+                                {"key": k, "value": {"stringValue": v}}
+                            )
+
+                        send_metrics_payload(metric_data)
+
+                    except Exception as e:
+                        print(
+                            json.dumps(
+                                {
+                                    "message": "Encountered error while emitting metric for run",
+                                    "run_url": run_url,
+                                    "exception": str(e),
+                                }
+                            )
+                        )
 
                     try:
                         print("Fetching logs for run:", run_url)
@@ -289,13 +409,13 @@ while True:
                                 payload.append(json_line)
 
                                 if payload_size > (5 * 1024 * 1024):
-                                    send_payload(payload)
+                                    send_logs_payload(payload)
 
                                     payload = []
                                     payload_size = 0
 
                         if len(payload) > 0:
-                            send_payload(payload)
+                            send_logs_payload(payload)
 
                         history[run_url] = True
                     except Exception as e:
