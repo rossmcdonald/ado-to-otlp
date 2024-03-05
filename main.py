@@ -16,6 +16,13 @@ import time
 from datetime import datetime, timezone
 import dateutil.parser
 from requests.auth import HTTPBasicAuth
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import (
+    PeriodicExportingMetricReader,
+)
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+
 
 print("Starting ado-to-otlp...")
 print("Runtime information:", sys.version)
@@ -50,6 +57,25 @@ if ado_url is None:
     ado_url = "https://dev.azure.com"
 organization_url = f"{ado_url}/{organization}"
 api_version = "7.2-preview.1"
+
+metric_reader = PeriodicExportingMetricReader(
+    OTLPMetricExporter(
+        endpoint="https://ingest.lightstep.com",
+        headers={"lightstep-access-token": cloudobs_access_token},
+    )
+)
+provider = MeterProvider(metric_readers=[metric_reader])
+metrics.set_meter_provider(provider)
+meter = metrics.get_meter("ado.meter")
+
+runs_counter = meter.create_counter(
+    "ado.runs",
+    description="The number of runs executed",
+)
+runs_time_taken_counter = meter.create_counter(
+    "ado.runs_time_taken_ms",
+    description="The time taken for each run in ms",
+)
 
 s = requests.Session()
 s.auth = HTTPBasicAuth("", access_token)
@@ -258,6 +284,7 @@ while True:
                     if run.get("state") != "completed":
                         continue
 
+                    print("Fetching data for run:", run_url)
                     try:
                         run_data = get_run(project_name, pipeline, run.get("id"))
 
@@ -266,80 +293,30 @@ while True:
                         time_taken_ms = int((finished - created).total_seconds()) * 1e6
 
                         attributes = {
-                            "state": run.get("state"),
-                            "result": run.get("result"),
-                            "name": run.get("name"),
-                            "project": project_name,
-                            "organization": organization,
-                            "pipeline_name": run_data.get("pipeline", {}).get("name"),
-                            "pipeline_folder": run_data.get("pipeline", {}).get(
-                                "folder"
+                            "run.state": str(run.get("state")),
+                            "run.result": str(run.get("result")),
+                            "run.name": str(run.get("name")),
+                            "run.project": str(project_name),
+                            "run.organization": str(organization),
+                            "run.pipeline.name": str(
+                                run_data.get("pipeline", {}).get("name")
                             ),
-                            "pipeline_revision": run_data.get("pipeline", {}).get(
-                                "revision"
+                            "run.pipeline.folder": str(
+                                run_data.get("pipeline", {}).get("folder")
                             ),
-                            "pipeline_id": run_data.get("pipeline", {}).get("id"),
+                            "run.pipeline.revision": str(
+                                run_data.get("pipeline", {}).get("revision")
+                            ),
                         }
 
-                        metric_data = {
-                            "resourceMetrics": [
-                                {
-                                    "resource": {
-                                        "attributes": [
-                                            {
-                                                "key": "service.name",
-                                                "value": {
-                                                    "stringValue": "azure-devops"
-                                                },
-                                            }
-                                        ]
-                                    },
-                                    "scopeMetrics": [
-                                        {
-                                            "metrics": [
-                                                {
-                                                    "name": "ado.run.time_taken_ms",
-                                                    "unit": "ms",
-                                                    "description": "The time taken in ms to execute a run",
-                                                    "gauge": {
-                                                        # "aggregationTemporality": 1,
-                                                        # "isMonotonic": True,
-                                                        "dataPoints": [
-                                                            {
-                                                                "asDouble": time_taken_ms,
-                                                                # "startTimeUnixNano": "1544712660300000000",
-                                                                "timeUnixNano": str(
-                                                                    int(
-                                                                        created.timestamp()
-                                                                        * 1e9
-                                                                    )
-                                                                ),
-                                                                "attributes": [],
-                                                            }
-                                                        ],
-                                                    },
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                }
-                            ]
-                        }
-
-                        for k, v in attributes.items():
-                            metric_data["resourceMetrics"][0]["scopeMetrics"][0][
-                                "metrics"
-                            ][0]["gauge"]["dataPoints"][0]["attributes"].append(
-                                {"key": k, "value": {"stringValue": v}}
-                            )
-
-                        send_metrics_payload(metric_data)
+                        runs_counter.add(1, attributes)
+                        runs_time_taken_counter.add(time_taken_ms, attributes)
 
                     except Exception as e:
                         print(
                             json.dumps(
                                 {
-                                    "message": "Encountered error while emitting metric for run",
+                                    "message": "Encountered error while generating metrics for run",
                                     "run_url": run_url,
                                     "exception": str(e),
                                 }
@@ -347,8 +324,6 @@ while True:
                         )
 
                     try:
-                        print("Fetching logs for run:", run_url)
-
                         payload = []
                         payload_size = 0
 
