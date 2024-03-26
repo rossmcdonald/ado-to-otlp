@@ -271,6 +271,8 @@ while True:
         for pipeline in projects[project_name].get("pipelines", []):
             runs = list_runs(project_name, pipeline)
             for run in runs.get("value"):
+                h = None
+
                 try:
                     run_url = run.get("url")
 
@@ -279,133 +281,115 @@ while True:
                     if start_time > run_created_at:
                         continue
 
-                    if history.get(run_url) is not None:
-                        continue
-
                     if run.get("state") != "completed":
                         continue
 
-                    print("Fetching data for run:", run_url)
-                    try:
-                        run_data = get_run(project_name, pipeline, run.get("id"))
-
-                        created = dateutil.parser.parse(run_data.get("createdDate"))
-                        finished = dateutil.parser.parse(run_data.get("finishedDate"))
-                        time_taken_ms = int((finished - created).total_seconds()) * 1e6
-
-                        attributes = {
-                            "run.state": str(run.get("state")),
-                            "run.result": str(run.get("result")),
-                            "run.name": str(run.get("name")),
-                            "run.project": str(project_name),
-                            "run.organization": str(organization),
-                            "run.pipeline.name": str(
-                                run_data.get("pipeline", {}).get("name")
-                            ),
-                            "run.pipeline.folder": str(
-                                run_data.get("pipeline", {}).get("folder")
-                            ),
-                            "run.pipeline.revision": str(
-                                run_data.get("pipeline", {}).get("revision")
-                            ),
+                    h = history.get(run_url)
+                    if h is None:
+                        h = {
+                            "finished": False,
+                            "attempts": 0,
                         }
 
-                        runs_counter.add(1, attributes)
-                        runs_time_taken_counter.add(time_taken_ms, attributes)
+                    if h.get("finished") == True:
+                        # already collected
+                        continue
+                    elif h.get("attempts") > 2:
+                        # exceeded attempt limit
+                        continue
 
-                    except Exception as e:
-                        print(
-                            json.dumps(
-                                {
-                                    "message": "Encountered error while generating metrics for run",
-                                    "run_url": run_url,
-                                    "exception": str(e),
-                                }
-                            )
+                    print("Fetching data for run:", run_url)
+                    run_data = get_run(project_name, pipeline, run.get("id"))
+
+                    created = dateutil.parser.parse(run_data.get("createdDate"))
+                    finished = dateutil.parser.parse(run_data.get("finishedDate"))
+                    time_taken_ms = int((finished - created).total_seconds()) * 1e3
+
+                    attributes = {
+                        "run.state": str(run.get("state")),
+                        "run.result": str(run.get("result")),
+                        "run.name": str(run.get("name")),
+                        "run.project": str(project_name),
+                        "run.organization": str(organization),
+                        "run.pipeline.name": str(
+                            run_data.get("pipeline", {}).get("name")
+                        ),
+                        "run.pipeline.folder": str(
+                            run_data.get("pipeline", {}).get("folder")
+                        ),
+                        "run.pipeline.revision": str(
+                            run_data.get("pipeline", {}).get("revision")
+                        ),
+                    }
+
+                    payload = []
+                    payload_size = 0
+
+                    logs_result = list_logs(project_name, pipeline, run.get("id"))
+                    for log in logs_result.get("logs"):
+                        log_results = get_log(
+                            project_name, pipeline, run.get("id"), log.get("id")
                         )
+                        log_url = log_results.get("url")
+                        log_url = log_results.get("signedContent", {}).get("url")
 
-                    try:
-                        payload = []
-                        payload_size = 0
+                        res = s.get(log_url)
+                        res.raise_for_status()
 
-                        logs_result = list_logs(project_name, pipeline, run.get("id"))
-                        for log in logs_result.get("logs"):
-                            log_results = get_log(
-                                project_name, pipeline, run.get("id"), log.get("id")
+                        log_lines = res.text.split("\n")
+                        for line in log_lines:
+                            line = line.strip()
+                            if line == "":
+                                continue
+
+                            line_content = {
+                                "organization": organization,
+                                "project": project_name,
+                                "body": line,
+                                "log.id": log_results.get("id"),
+                                "log.url": log_results.get("url"),
+                                "log.line_count": log_results.get("lineCount"),
+                                "run.url": run.get("_links", {})
+                                .get("web", {})
+                                .get("href"),
+                                "run.state": run.get("state"),
+                                "run.result": run.get("result"),
+                                "run.id": run.get("id"),
+                                "run.name": run.get("name"),
+                                "pipeline.name": run.get("pipeline", {}).get("name"),
+                                "pipeline.folder": run.get("pipeline", {}).get(
+                                    "folder"
+                                ),
+                                "pipeline.revision": run.get("pipeline", {}).get(
+                                    "revision"
+                                ),
+                                "pipeline.id": run.get("pipeline", {}).get("id"),
+                                "pipeline.url": run.get("_links", {}).get(
+                                    "pipeline.web"
+                                ),
+                                "_ts": log_results.get("createdOn"),
+                            }
+
+                            action_line = (
+                                '{ "index" : { "_index" : "ado_pipeline_logs" } }'
                             )
-                            log_url = log_results.get("url")
-                            log_url = log_results.get("signedContent", {}).get("url")
+                            json_line = json.dumps(line_content)
+                            payload_size += len(json_line) + len(action_line)
 
-                            res = s.get(log_url)
-                            res.raise_for_status()
+                            payload.append(action_line)
+                            payload.append(json_line)
 
-                            log_lines = res.text.split("\n")
-                            for line in log_lines:
-                                line = line.strip()
-                                if line == "":
-                                    continue
+                            if payload_size > (
+                                2 * 1024 * 1024
+                            ):  # Aim for ~2 MB request size
+                                send_logs_payload(payload)
 
-                                line_content = {
-                                    "organization": organization,
-                                    "project": project_name,
-                                    "body": line,
-                                    "log.id": log_results.get("id"),
-                                    "log.url": log_results.get("url"),
-                                    "log.line_count": log_results.get("lineCount"),
-                                    "run.url": run.get("_links", {})
-                                    .get("web", {})
-                                    .get("href"),
-                                    "run.state": run.get("state"),
-                                    "run.result": run.get("result"),
-                                    "run.id": run.get("id"),
-                                    "run.name": run.get("name"),
-                                    "pipeline.name": run.get("pipeline", {}).get(
-                                        "name"
-                                    ),
-                                    "pipeline.folder": run.get("pipeline", {}).get(
-                                        "folder"
-                                    ),
-                                    "pipeline.revision": run.get("pipeline", {}).get(
-                                        "revision"
-                                    ),
-                                    "pipeline.id": run.get("pipeline", {}).get("id"),
-                                    "pipeline.url": run.get("_links", {}).get(
-                                        "pipeline.web"
-                                    ),
-                                    "_ts": log_results.get("createdOn"),
-                                }
+                                payload = []
+                                payload_size = 0
 
-                                action_line = (
-                                    '{ "index" : { "_index" : "ado_pipeline_logs" } }'
-                                )
-                                json_line = json.dumps(line_content)
-                                payload_size += len(json_line) + len(action_line)
-
-                                payload.append(action_line)
-                                payload.append(json_line)
-
-                                if payload_size > (5 * 1024 * 1024):
-                                    send_logs_payload(payload)
-
-                                    payload = []
-                                    payload_size = 0
-
-                        if len(payload) > 0:
-                            send_logs_payload(payload)
-
-                        history[run_url] = True
-                    except Exception as e:
-                        print(
-                            json.dumps(
-                                {
-                                    "message": "Encountered error while retrieving logs for run",
-                                    "run_url": run_url,
-                                    "log_url": log_url,
-                                    "exception": str(e),
-                                }
-                            )
-                        )
-                        time.sleep(1)
+                    if len(payload) > 0:
+                        # For any remaining logs
+                        send_logs_payload(payload)
 
                 except Exception as e:
                     print(
@@ -413,13 +397,25 @@ while True:
                             {
                                 "message": "Encountered error on run",
                                 "run_url": run_url,
+                                "attempt": h["attempts"],
                                 "exception": str(e),
                             }
                         )
                     )
 
+                    h["attempts"] += 1
+                    history[run_url] = h
+                else:
+                    runs_counter.add(1, attributes)
+                    runs_time_taken_counter.add(time_taken_ms, attributes)
+                    h["finished"] = True
+                    history[run_url] = h
+
     time.sleep(30)
 
-    if ((datetime.now(timezone.utc) - last_cache_update).seconds / 60) > 30:
+    if (
+        (datetime.now(timezone.utc) - last_cache_update).seconds / 60
+    ) > 30:  # rebuild cache every 30 minutes
         build_project_cache()
         build_pipeline_cache()
+        last_cache_update = datetime.now(timezone.utc)
